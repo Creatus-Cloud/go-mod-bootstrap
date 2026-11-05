@@ -161,15 +161,18 @@ func TestManager_Run(t *testing.T) {
 
 	mockReporter.AssertExpectations(t)
 
-	runExited := false
+	runExited := make(chan struct{})
 	go func() {
 		wg.Wait()
-		runExited = true
+		close(runExited)
 	}()
 
 	cancel()
-	time.Sleep(time.Millisecond * 100)
-	assert.True(t, runExited)
+	select {
+	case <-runExited:
+	case <-time.After(time.Second):
+		t.Fatal("metrics manager did not stop")
+	}
 }
 
 func TestManager_Run_Error(t *testing.T) {

@@ -96,8 +96,17 @@ func (r *messageBusReporter) Report(registry gometrics.Registry, metricTags map[
 		return errors.New("messaging client not available. Unable to report metrics")
 	}
 
-	// Build the service tags each time we report since that can be changed in the Writable config
-	serviceTags := buildMetricTags(r.config.Tags)
+	// Configuration implementations may return independent snapshots. Read a
+	// fresh one for each report so metrics and tags stay live without retaining
+	// pointers into mutable service configuration.
+	telemetry := r.config
+	if configuration := container.ConfigurationFrom(r.dic.Get); configuration != nil {
+		telemetry = configuration.GetTelemetryInfo()
+	}
+	if telemetry == nil {
+		return errors.New("telemetry configuration not available")
+	}
+	serviceTags := buildMetricTags(telemetry.Tags)
 	serviceTags = append(serviceTags, dtos.MetricTag{
 		Name:  serviceNameTagKey,
 		Value: r.serviceName,
@@ -112,7 +121,7 @@ func (r *messageBusReporter) Report(registry gometrics.Registry, metricTags map[
 		// This is important for Metrics for App Service Pipelines, when the Metric name reported need to be the same
 		// for all pipelines, but each will have to have unique name (with pipeline ID added) registered.
 		// The Pipeline id will also be added as a tag.
-		name, isEnabled := r.config.GetEnabledMetricName(itemName)
+		name, isEnabled := telemetry.GetEnabledMetricName(itemName)
 		if !isEnabled {
 			// This metric is not enable so do not report it.
 			return

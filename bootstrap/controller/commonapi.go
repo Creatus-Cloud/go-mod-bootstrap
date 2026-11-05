@@ -108,8 +108,16 @@ func (c *CommonController) Config(e echo.Context) error {
 	request := e.Request()
 	writer := e.Response()
 	var fullConfig interface{}
+	configuration := c.config.configuration
+	if snapshots, ok := configuration.(interfaces.ConfigurationSnapshotProvider); ok {
+		snapshot, err := snapshots.GetConfigurationSnapshot()
+		if err != nil {
+			return utils.SendJsonErrResp(c.lc, writer, request, errors.KindServerError, "config snapshot unavailable", err, "")
+		}
+		configuration = snapshot
+	}
 	m := make(map[string]any)
-	err := mapstructure.Decode(c.config.configuration, &m)
+	err := mapstructure.Decode(configuration, &m)
 	if err != nil {
 		c.lc.Errorf("%v", err.Error())
 		return utils.SendJsonErrResp(c.lc, writer, request, errors.KindServerError, "config can not convert to map", err, "")

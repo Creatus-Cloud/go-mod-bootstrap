@@ -26,7 +26,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -73,6 +72,7 @@ var errInvalidRemoteHosts = errors.New("-rsh/--remoteServiceHosts must contain 3
 type UpdatedStream chan struct{}
 
 type Processor struct {
+	writableMu          sync.Mutex
 	lc                  logger.LoggingClient
 	flags               flags.Common
 	envVars             *environment.Variables
@@ -326,14 +326,14 @@ func (cp *Processor) loadConfigByProvider(
 	// listen for changes on Writable
 	cp.listenForPrivateChanges(serviceConfig, cp.privateConfigClient, utils.BuildBaseKey(configStem, serviceKey))
 	cp.lc.Infof("listening for private config changes")
-	cp.listenForCommonChanges(serviceConfig, cp.commonConfigClient, cp.privateConfigClient, utils.BuildBaseKey(configStem, common.CoreCommonConfigServiceKey, allServicesKey))
+	cp.listenForCommonChanges(serviceConfig, cp.commonConfigClient)
 	cp.lc.Infof("listening for all services common config changes")
 	if cp.appConfigClient != nil {
-		cp.listenForCommonChanges(serviceConfig, cp.appConfigClient, cp.privateConfigClient, utils.BuildBaseKey(configStem, common.CoreCommonConfigServiceKey, appServicesKey))
+		cp.listenForCommonChanges(serviceConfig, cp.appConfigClient)
 		cp.lc.Infof("listening for application service common config changes")
 	}
 	if cp.deviceConfigClient != nil {
-		cp.listenForCommonChanges(serviceConfig, cp.deviceConfigClient, cp.privateConfigClient, utils.BuildBaseKey(configStem, common.CoreCommonConfigServiceKey, deviceServicesKey))
+		cp.listenForCommonChanges(serviceConfig, cp.deviceConfigClient)
 		cp.lc.Infof("listening for device service common config changes")
 	}
 	return nil
@@ -822,141 +822,57 @@ func (cp *Processor) listenForPrivateChanges(serviceConfig interfaces.Configurat
 	}()
 }
 
-// listenForCommonChanges leverages the Configuration Provider client's WatchForChanges() method to receive changes to and update the
-// service's common configuration writable sub-struct.
-func (cp *Processor) listenForCommonChanges(fullServiceConfig interfaces.Configuration, configClient configuration.Client,
-	privateConfigClient configuration.Client, baseKey string) {
+// listenForCommonChanges reloads every configuration layer after a common
+// Writable notification. Layer precedence preserves app/device and private
+// overrides without discarding other changes bundled in the same notification.
+func (cp *Processor) listenForCommonChanges(fullServiceConfig interfaces.Configuration, configClient configuration.Client) {
 	lc := cp.lc
-	isFirstUpdate := true
-	baseKey = utils.BuildBaseKey(baseKey, writableKey)
-
 	cp.wg.Add(1)
-	go func(fullServiceConfig interfaces.Configuration,
-		commonConfigClient configuration.Client,
-		privateConfigClient configuration.Client, baseKey string) {
+	go func() {
 		defer cp.wg.Done()
-
-		var previousCommonWritable any
-
+		isFirstUpdate := true
 		errorStream := make(chan error)
 		updateStream := make(chan any)
-
-		go commonConfigClient.WatchForChanges(updateStream, errorStream, fullServiceConfig.EmptyWritablePtr(), writableKey, cp.getMessageClient)
+		go configClient.WatchForChanges(updateStream, errorStream, fullServiceConfig.EmptyWritablePtr(), writableKey, cp.getMessageClient)
 
 		for {
 			select {
 			case <-cp.ctx.Done():
-				commonConfigClient.StopWatching()
+				configClient.StopWatching()
 				lc.Infof("Watching for '%s' configuration changes has stopped", writableKey)
 				return
-
 			case ex := <-errorStream:
 				lc.Errorf("error occurred during listening to the configuration changes: %s", ex.Error())
-
-			case raw, ok := <-updateStream:
+			case _, ok := <-updateStream:
 				if !ok {
 					return
 				}
-
-				usedKeys, err := commonConfigClient.GetConfigurationKeys(writableKey)
-				if err != nil {
-					if err != nil {
-						lc.Errorf("failed to get list of common configuration keys for %s: %v", writableKey, err)
-					}
-				}
-
-				rawMap, err := utils.RemoveUnusedSettings(raw, baseKey, utils.StringSliceToMap(usedKeys))
-				if err != nil {
-					lc.Errorf("failed to remove unused common settings in %s: %v", writableKey, err)
-				}
-
-				// Config Provider sends an update as soon as the watcher is connected even though there are not
-				// any changes to the configuration. This causes an issue during start-up if there is an
-				// envVars override of one of the Writable fields, so on the first update we can just save a copy of the
-				// common writable for comparison for future writable updates.
+				// The provider announces its initial connection without a change.
+				// Keep startup/environment overrides until a real update arrives.
 				if isFirstUpdate {
-					// When the configuration provider sends an initial update (raw == nil), it indicates the watcher has connected
-					// but no configuration changes have occurred. In this case, we use the writable configuration directly from
-					// the full service configuration to establish a baseline for future comparisons.
-					if raw == nil {
-						w := fullServiceConfig.GetWritablePtr()
-						rawMap, err = utils.RemoveUnusedSettings(w, baseKey, utils.StringSliceToMap(usedKeys))
-						if err != nil {
-							lc.Errorf("failed to remove unused common settings in %s: %v", writableKey, err)
-						}
-					}
 					isFirstUpdate = false
-					previousCommonWritable = rawMap
 					continue
 				}
-
-				if err := cp.processCommonConfigChange(fullServiceConfig, previousCommonWritable, rawMap, privateConfigClient, configClient); err != nil {
-					lc.Error(err.Error())
-				}
-
-				// ensure that the local copy of the common writable gets updated no matter what
-				previousCommonWritable = rawMap
+				cp.applyWritableUpdates(fullServiceConfig)
 			}
 		}
-	}(fullServiceConfig, configClient, privateConfigClient, baseKey)
-}
-
-func (cp *Processor) processCommonConfigChange(fullServiceConfig interfaces.Configuration, previousCommonWritable any, raw any, privateConfigClient configuration.Client, configClient configuration.Client) error {
-	changedKey, found := cp.findChangedKey(previousCommonWritable, raw)
-	if found {
-		// Only need to check App/Device writable if change was made to the all-services writable
-		if configClient == cp.commonConfigClient {
-			// check if changed value (from all-services) is an App or Device common override
-			otherConfigClient := cp.appConfigClient
-			if otherConfigClient == nil {
-				otherConfigClient = cp.deviceConfigClient
-			}
-
-			// This case should not happen at this point, but need to guard against nil pointer
-			if otherConfigClient != nil {
-				if cp.isKeyInConfig(otherConfigClient, changedKey) {
-					cp.lc.Warnf("ignoring changed writable key %s overwritten in App or Device common writable", changedKey)
-					return nil
-				}
-			}
-
-		}
-
-		// check if changed value is a private override
-		if cp.isKeyInConfig(privateConfigClient, changedKey) {
-			cp.lc.Warnf("ignoring changed writable key %s overwritten in private writable", changedKey)
-			return nil
-		}
-	}
-
-	cp.applyWritableUpdates(fullServiceConfig)
-	return nil
-}
-
-func (cp *Processor) findChangedKey(previous any, updated any) (string, bool) {
-	var changedKey string
-	var previousMap, updatedMap map[string]any
-	if err := utils.ConvertToMap(previous, &previousMap); err != nil {
-		cp.lc.Errorf("could not convert previous interface to map: %s", err.Error())
-		return "", false
-	}
-	if err := utils.ConvertToMap(updated, &updatedMap); err != nil {
-		cp.lc.Errorf("could not convert updated interface to map: %s", err.Error())
-		return "", false
-	}
-	changedKey = walkMapForChange(previousMap, updatedMap, "")
-	if changedKey == "" {
-		// look the other way around to see if an item was removed
-		changedKey = walkMapForChange(updatedMap, previousMap, "")
-		if changedKey == "" {
-			cp.lc.Error("could not find updated writable key or an error occurred")
-			return "", false
-		}
-	}
-	return changedKey, true
+	}()
 }
 
 func (cp *Processor) applyWritableUpdates(serviceConfig interfaces.Configuration) {
+	// Common and private watchers share this processor. Reload and publish one
+	// complete Writable snapshot at a time.
+	cp.writableMu.Lock()
+	defer cp.writableMu.Unlock()
+
+	ctx := cp.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+
 	lc := cp.lc
 	previousLogLevel := serviceConfig.GetLogLevel()
 	previousTelemetryInterval := serviceConfig.GetTelemetryInfo().Interval
@@ -966,15 +882,12 @@ func (cp *Processor) applyWritableUpdates(serviceConfig interfaces.Configuration
 		lc.Errorf("failed to deep copy insecure secrets: %v", err)
 	}
 
-	serviceConfigCopy, err := copyConfigurationStruct(serviceConfig)
+	// Provider layers populate a fresh object. Copying the live configuration
+	// before zeroing it reads mutable fields for no purpose and races writers.
+	serviceConfigCopy, err := emptyConfigurationStruct(serviceConfig)
 	if err != nil {
-		lc.Errorf("failed to copy configuration struct: %v", err)
+		lc.Errorf("failed to create empty configuration struct: %v", err)
 		return
-	}
-	v := reflect.ValueOf(serviceConfigCopy)
-	if v.Kind() == reflect.Ptr && !v.IsNil() {
-		v = v.Elem()
-		v.Set(reflect.Zero(v.Type()))
 	}
 
 	err = cp.loadConfigFromProvider(serviceConfigCopy, cp.commonConfigClient)
@@ -1007,7 +920,12 @@ func (cp *Processor) applyWritableUpdates(serviceConfig interfaces.Configuration
 		}
 	}
 
-	serviceConfig.UpdateFromRaw(serviceConfigCopy)
+	// These watchers observe Writable only. Preserve startup-only fields such
+	// as remote/dev host overrides and publish through the writable accessor.
+	if !serviceConfig.UpdateWritableFromRaw(serviceConfigCopy.GetWritablePtr()) {
+		lc.Error("failed to apply writable configuration snapshot")
+		return
+	}
 
 	currentInsecureSecrets := serviceConfig.GetInsecureSecrets()
 	currentLogLevel := serviceConfig.GetLogLevel()
@@ -1015,51 +933,48 @@ func (cp *Processor) applyWritableUpdates(serviceConfig interfaces.Configuration
 
 	lc.Info("Writable configuration has been updated from the Configuration Provider")
 
-	// Note: Updates occur one setting at a time so only have to look for single changes
-	switch {
-	case currentLogLevel != previousLogLevel:
-		_ = lc.SetLogLevel(serviceConfig.GetLogLevel())
-		lc.Info(fmt.Sprintf("Logging level changed to %s", currentLogLevel))
+	// Provider notifications can include several changed settings. Apply every
+	// bootstrap-owned change, then notify the service about the whole reload.
+	if currentLogLevel != previousLogLevel {
+		if err := lc.SetLogLevel(currentLogLevel); err != nil {
+			lc.Errorf("failed to update logging level: %v", err)
+		} else {
+			lc.Infof("Logging level changed to %s", currentLogLevel)
+		}
+	}
 
-	// InsecureSecrets (map) will be nil if not in the original TOML used to seed the Config Provider,
-	// so ignore it if this is the case.
-	case currentInsecureSecrets != nil &&
-		!reflect.DeepEqual(currentInsecureSecrets, previousInsecureSecrets):
+	if !reflect.DeepEqual(currentInsecureSecrets, previousInsecureSecrets) {
 		lc.Info("Insecure Secrets have been updated")
 		secretProvider := container.SecretProviderExtFrom(cp.dic.Get)
 		if secretProvider != nil {
-			// Find the updated secret's path and perform call backs.
-			updatedSecrets := getSecretNamesChanged(previousInsecureSecrets, currentInsecureSecrets)
-			for _, v := range updatedSecrets {
-				secretProvider.SecretUpdatedAtSecretName(v)
+			for _, name := range getSecretNamesChanged(previousInsecureSecrets, currentInsecureSecrets) {
+				secretProvider.SecretUpdatedAtSecretName(name)
 			}
 		}
+	}
 
-	case currentTelemetryInterval != previousTelemetryInterval:
-		lc.Info("Telemetry interval has been updated. Processing new value...")
+	if currentTelemetryInterval != previousTelemetryInterval {
 		interval, err := time.ParseDuration(currentTelemetryInterval)
-		if err != nil {
-			lc.Errorf("update telemetry interval value is invalid time duration, using previous value: %s", err.Error())
-			break
+		if err != nil || interval < 0 {
+			lc.Error("invalid telemetry interval; keeping the previous reporting interval", "interval", currentTelemetryInterval)
+		} else {
+			if interval == 0 {
+				lc.Info("0 specified for metrics reporting interval. Disabling periodic reporting.")
+				interval = math.MaxInt64
+			}
+			metricsManager := container.MetricsManagerFrom(cp.dic.Get)
+			if metricsManager == nil {
+				lc.Error("metrics manager not available while updating telemetry interval")
+			} else {
+				metricsManager.ResetInterval(interval)
+			}
 		}
+	}
 
-		if interval == 0 {
-			lc.Infof("0 specified for metrics reporting interval. Setting to max duration to effectively disable reporting.")
-			interval = math.MaxInt64
-		}
-
-		metricsManager := container.MetricsManagerFrom(cp.dic.Get)
-		if metricsManager == nil {
-			lc.Error("metrics manager not available while updating telemetry interval")
-			break
-		}
-
-		metricsManager.ResetInterval(interval)
-
-	default:
-		// Signal that configuration updates exists that have not already been processed.
-		if cp.configUpdated != nil {
-			cp.configUpdated <- struct{}{}
+	if cp.configUpdated != nil {
+		select {
+		case cp.configUpdated <- struct{}{}:
+		case <-ctx.Done():
 		}
 	}
 }
@@ -1194,8 +1109,21 @@ func getSecretNamesChanged(prevVals config.InsecureSecrets, curVals config.Insec
 	return updatedNames
 }
 
-// copyConfigurationStruct returns a copy of the passed in configuration interface
+// emptyConfigurationStruct allocates the provider decode target without reading
+// any fields of the live configuration.
+func emptyConfigurationStruct(configuration interfaces.Configuration) (interfaces.Configuration, error) {
+	typ := reflect.TypeOf(configuration)
+	if typ == nil || typ.Kind() != reflect.Ptr || typ.Elem().Kind() != reflect.Struct {
+		return nil, errors.New("configuration must be a pointer to a struct")
+	}
+	return reflect.New(typ.Elem()).Interface().(interfaces.Configuration), nil
+}
+
+// copyConfigurationStruct copies startup configuration before watchers run.
 func copyConfigurationStruct(config interfaces.Configuration) (interfaces.Configuration, error) {
+	if snapshots, ok := config.(interfaces.ConfigurationSnapshotProvider); ok {
+		return snapshots.GetConfigurationSnapshot()
+	}
 	rawCopy, err := copystructure.Copy(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load copy the configuration: %s", err.Error())
@@ -1205,66 +1133,6 @@ func copyConfigurationStruct(config interfaces.Configuration) (interfaces.Config
 		return nil, errors.New("failed to cast the copy of the configuration")
 	}
 	return configCopy, nil
-}
-
-func walkMapForChange(previousMap map[string]any, updatedMap map[string]any, changedKey string) string {
-	for updatedKey, updatedVal := range updatedMap {
-		previousVal, ok := previousMap[updatedKey]
-		if !ok {
-			return buildNewKey(changedKey, updatedKey)
-		}
-		updatedSubMap, ok := updatedVal.(map[string]any)
-		// if the value is not of type map[string]any, it should be a value to compare
-		if !ok {
-			if updatedVal != previousVal {
-				return buildNewKey(changedKey, updatedKey)
-			}
-			continue
-		}
-		previousSubMap, ok := previousVal.(map[string]any)
-		if !ok {
-			// handle the case where a new setting is added
-			if previousSubMap == nil && updatedSubMap != nil {
-				subKey := buildNewKey(changedKey, updatedKey)
-				for k := range updatedSubMap {
-					return buildNewKey(subKey, k)
-				}
-			}
-			return ""
-		}
-		key := buildNewKey(changedKey, updatedKey)
-		key = walkMapForChange(previousSubMap, updatedSubMap, key)
-		if len(key) > 0 {
-			return key
-		}
-	}
-	return ""
-}
-
-func (cp *Processor) isKeyInConfig(configClient configuration.Client, changedKey string) bool {
-	keys, err := configClient.GetConfigurationKeys(writableKey)
-	if err != nil {
-		cp.lc.Errorf("could not get writable keys from configuration: %s", err.Error())
-		// return true because shouldn't change an overridden value
-		// error means it is undetermined, so don't override to be safe
-		return true
-	}
-	changedKey = fmt.Sprintf("%s/%s", writableKey, changedKey)
-
-	for _, key := range keys {
-		if strings.Contains(key, changedKey) {
-			return true
-		}
-	}
-	return false
-}
-
-func buildNewKey(previousKey, currentKey string) string {
-	if previousKey != "" {
-		return utils.BuildBaseKey(previousKey, currentKey)
-	} else {
-		return currentKey
-	}
 }
 
 // GetInsecureSecretNameFullPath returns the full configuration path of an InsecureSecret's SecretName field.

@@ -65,3 +65,10 @@ type Configuration interface {
 	// GetWritablePtr gets the config.WritablePtr section from the ConfigurationStruct
 	GetWritablePtr() any
 }
+
+// ConfigurationSnapshotProvider optionally supplies a synchronized, independent
+// copy for reflective readers such as the configuration API and startup copier.
+// Implementations must return the same concrete configuration type.
+type ConfigurationSnapshotProvider interface {
+	GetConfigurationSnapshot() (Configuration, error)
+}
